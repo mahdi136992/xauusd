@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """بررسی XAUUSD: RSI اشباع + واگرایی معمولی -> پیام تلگرام (اجرا روی GitHub Actions)"""
-import json, os, requests
+import json, os, time, requests
 from datetime import datetime, timezone
 
 RSI_LEN, SMA_LEN, OB, OS = 14, 14, 70, 30
@@ -21,11 +21,20 @@ TF = {
  "12h": (720, "1h", "60m", "90d", 12), "1d": (1440, "1day", "1d", "2y", 1),
 }
 
-def send(text):
+def api(method, **params):
+    try:
+        return requests.post(f"https://api.telegram.org/bot{TOKEN}/{method}", json=params, timeout=40).json()
+    except Exception as e:
+        print(method, "error:", e)
+        return {}
+
+def send(text, markup=None):
     print(text)
     if TOKEN and CHAT:
-        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                      data={"chat_id": CHAT, "text": text}, timeout=20)
+        p = {"chat_id": CHAT, "text": text}
+        if markup:
+            p["reply_markup"] = markup
+        api("sendMessage", **p)
 
 def fetch(tf):
     m, tdi, yi, yr, f = TF[tf]
@@ -115,46 +124,105 @@ def analyze(tf, sent):
              f"پیووت قبلی: {fmt(cs[j][0])} UTC → قیمت {po:.2f} | RSI {r[j]:.1f}")
     return res
 
-def tg_commands(st):
-    """دستورات تلگرام (هر بار اجرا پردازش می‌شود): /start /tf /status"""
+ORDER = ["1m", "2m", "3m", "5m", "10m", "15m", "30m", "1h", "2h", "3h", "4h", "6h", "12h", "1d"]
+
+def keyboard(st):
+    rows, row = [], []
+    for t in ORDER:
+        row.append({"text": ("✅ " if t in st["tfs"] else "") + t, "callback_data": "tf:" + t})
+        if len(row) == 4:
+            rows.append(row); row = []
+    if row: rows.append(row)
+    rows.append([{"text": "📊 وضعیت و RSI", "callback_data": "status"},
+                 {"text": "▶️ ادامه هشدار" if st.get("paused") else "⏸ توقف هشدار", "callback_data": "toggle"}])
+    return {"inline_keyboard": rows}
+
+def menu_text(st):
+    return ("⚙️ تنظیمات ربات XAUUSD\n"
+            "روی هر تایم‌فریم بزنید تا روشن (✅) یا خاموش شود.\n"
+            f"وضعیت: {'⏸ متوقف' if st.get('paused') else '▶️ فعال'}\n"
+            f"تایم‌فریم‌ها: {', '.join(st['tfs'])}")
+
+def status_text(st):
+    lines = []
+    for tf in st["tfs"]:
+        try:
+            r = analyze(tf, [])
+            lines.append(f"{tf}: قیمت {r[0]:.2f} | RSI {r[1]:.1f} | MA {r[2]:.1f}" if r else f"{tf}: داده کافی نیست")
+        except Exception as e:
+            lines.append(f"{tf}: خطا در دریافت داده")
+    return "\n".join(lines)
+
+def refresh_menu(st, msg):
+    api("editMessageText", chat_id=msg["chat"]["id"], message_id=msg["message_id"],
+        text=menu_text(st), reply_markup=keyboard(st))
+
+def tg_commands(st, wait=0):
+    """دستورها و دکمه‌های تلگرام"""
     global CHAT
     if not TOKEN:
         return
-    try:
-        ups = requests.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates",
-                           params={"offset": st.get("offset", 0), "timeout": 0}, timeout=20).json().get("result", [])
-    except Exception as e:
-        print("getUpdates error:", e); return
+    ups = api("getUpdates", offset=st.get("offset", 0), timeout=wait,
+              allowed_updates=["message", "callback_query"]).get("result", [])
     for u in ups:
         st["offset"] = u["update_id"] + 1
-        m = u.get("message") or {}
-        text = (m.get("text") or "").strip()
+        cq = u.get("callback_query")
+        m = cq["message"] if cq else (u.get("message") or {})
+        if not m:
+            continue
+        chat = str(m["chat"]["id"])
+        if st.get("chat_id") and chat != st["chat_id"]:
+            continue  # فقط صاحب ربات
+        st["chat_id"] = CHAT = chat
+
+        if cq:  # ---- دکمه‌ها
+            d = cq.get("data", "")
+            note = None
+            if d.startswith("tf:"):
+                t = d[3:]
+                if t in st["tfs"]:
+                    if len(st["tfs"]) > 1: st["tfs"].remove(t)
+                    else: note = "حداقل یک تایم‌فریم لازم است"
+                elif t in TF:
+                    st["tfs"] = [x for x in ORDER if x in st["tfs"] or x == t]
+                refresh_menu(st, m)
+            elif d == "toggle":
+                st["paused"] = not st.get("paused", False)
+                refresh_menu(st, m)
+            elif d == "status":
+                send(status_text(st))
+            api("answerCallbackQuery", callback_query_id=cq["id"], **({"text": note} if note else {}))
+            continue
+
+        text = (m.get("text") or "").strip()  # ---- دستورها
         if not text.startswith("/"):
             continue
-        st["chat_id"] = CHAT = str(m["chat"]["id"])
         parts = text.split(); cmd = parts[0].split("@")[0].lower()
-        if cmd == "/start":
-            send("✅ ربات فعال شد.\nتایم‌فریم فعلی: " + ", ".join(st["tfs"]) +
-                 "\n\n/tf 15m 1h ← تغییر تایم‌فریم\n/tf ← لیست مجاز\n/status ← RSI فعلی\n"
-                 "(پاسخ دستورها تا ۵ دقیقه طول می‌کشد)")
-        elif cmd == "/tf":
-            if len(parts) == 1:
-                send("مجاز: " + " ".join(TF) + "\nفعلی: " + ", ".join(st["tfs"]))
-            else:
-                new = [p.lower() for p in parts[1:] if p.lower() in TF]
-                if new:
-                    st["tfs"] = new; send("✅ تایم‌فریم: " + ", ".join(new))
-                else:
-                    send("تایم‌فریم نامعتبر. مجاز: " + " ".join(TF))
+        if cmd in ("/start", "/menu"):
+            send(menu_text(st), keyboard(st))
+        elif cmd == "/tf" and len(parts) > 1:
+            new = [p.lower() for p in parts[1:] if p.lower() in TF]
+            if new:
+                st["tfs"] = [x for x in ORDER if x in new]; send("✅ تایم‌فریم: " + ", ".join(st["tfs"]))
         elif cmd == "/status":
-            lines = []
-            for tf in st["tfs"]:
-                try:
-                    r = analyze(tf, [])
-                    lines.append(f"{tf}: قیمت {r[0]:.2f} | RSI {r[1]:.1f} | MA {r[2]:.1f}" if r else f"{tf}: داده کافی نیست")
-                except Exception as e:
-                    lines.append(f"{tf}: خطا")
-            send("\n".join(lines))
+            send(status_text(st))
+        elif cmd == "/pause":
+            st["paused"] = True; send("⏸ متوقف شد")
+        elif cmd == "/resume":
+            st["paused"] = False; send("▶️ ادامه یافت")
+        else:
+            send(menu_text(st), keyboard(st))
+    if ups:  # تأیید دریافت در خود تلگرام تا تکرار نشوند
+        api("getUpdates", offset=st["offset"], timeout=0)
+
+def scan(st):
+    if st.get("paused"):
+        return
+    for tf in st["tfs"]:
+        try:
+            analyze(tf, st["sent"])
+        except Exception as e:
+            print("خطا", tf, e)
 
 def main():
     global CHAT
@@ -162,18 +230,18 @@ def main():
         st = json.load(open(STATE))
     except Exception:
         st = {}
-    st.setdefault("sent", []); st.setdefault("offset", 0)
+    st.setdefault("sent", []); st.setdefault("offset", 0); st.setdefault("paused", False)
     st.setdefault("tfs", [t for t in TFS if t in TF] or ["15m"])
     if st.get("chat_id") and not CHAT:
         CHAT = st["chat_id"]
-    tg_commands(st)
+    end = time.time() + int(os.environ.get("LOOP_SECONDS", "230"))
+    tg_commands(st, 0)
     if os.environ.get("EVENT") == "workflow_dispatch":
         send(f"✅ ربات ابری فعال است. تایم‌فریم: {', '.join(st['tfs'])}")
-    for tf in st["tfs"]:
-        try:
-            analyze(tf, st["sent"])
-        except Exception as e:
-            print("خطا", tf, e)
+    scan(st)
+    # تا پایان این اجرا منتظر دکمه‌ها می‌ماند تا پاسخ تقریباً فوری باشد
+    while TOKEN and time.time() < end - 2:
+        tg_commands(st, int(min(20, max(1, end - time.time()))))
     st["sent"] = st["sent"][-300:]
     json.dump(st, open(STATE, "w"))
 
